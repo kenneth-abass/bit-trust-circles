@@ -92,3 +92,111 @@
   { user: principal, circle-id: uint }
   { amount: uint }
 )
+
+;; Governance Proposals
+(define-map proposals
+  { proposal-id: uint }
+  {
+    circle-id: uint,
+    proposer: principal,
+    proposal-type: (string-ascii 32), ;; "slash", "reward", "kick", "upgrade"
+    target: (optional principal),
+    amount: uint,
+    description: (string-ascii 256),
+    votes-for: uint,
+    votes-against: uint,
+    total-votes: uint,
+    created-at: uint,
+    expires-at: uint,
+    executed: bool
+  }
+)
+
+;; Voting Records
+(define-map votes
+  { proposal-id: uint, voter: principal }
+  { vote: bool, weight: uint, timestamp: uint }
+)
+
+;; STATE VARIABLES
+
+(define-data-var next-circle-id uint u1)
+(define-data-var next-proposal-id uint u1)
+(define-data-var protocol-fee uint u50) ;; 0.5% fee in basis points
+
+;; PRIVATE HELPER FUNCTIONS
+
+(define-private (is-circle-member (circle-id uint) (user principal))
+  ;; Check if a user is a member of a specific circle
+  (is-some (map-get? circle-members { circle-id: circle-id, member: user }))
+)
+
+(define-private (get-member-reputation (circle-id uint) (member principal))
+  ;; Get reputation score for a member in a specific circle
+  (default-to u0 
+    (get reputation-score 
+      (map-get? circle-members { circle-id: circle-id, member: member })))
+)
+
+(define-private (calculate-voting-weight (circle-id uint) (voter principal))
+  ;; Calculate voting power based on stake amount and reputation score
+  (let ((member-data (map-get? circle-members { circle-id: circle-id, member: voter })))
+    (match member-data
+      data (+ (get stake-amount data) (get reputation-score data))
+      u0
+    )
+  )
+)
+
+(define-private (update-user-reputation (user principal) (reputation-change int))
+  ;; Update global reputation for a user (can be positive or negative)
+  (let ((current-rep (default-to 
+                       { total-reputation: u0, circles-joined: u0, total-staked: u0, last-updated: u0 }
+                       (map-get? user-reputation { user: user }))))
+    (map-set user-reputation
+      { user: user }
+      (merge current-rep {
+        total-reputation: (if (>= reputation-change 0)
+                           (+ (get total-reputation current-rep) (to-uint reputation-change))
+                           (if (> (get total-reputation current-rep) (to-uint (- reputation-change)))
+                             (- (get total-reputation current-rep) (to-uint (- reputation-change)))
+                             u0)),
+        last-updated: stacks-block-height
+      })
+    )
+  )
+)
+
+;; PUBLIC FUNCTIONS - CIRCLE MANAGEMENT
+
+(define-public (create-circle (name (string-ascii 64)) (is-public bool) (stake-threshold uint))
+  ;; Create a new trust circle with specified parameters
+  (let ((circle-id (var-get next-circle-id)))
+    ;; Validate input parameters
+    (asserts! (>= stake-threshold MIN_CIRCLE_STAKE) ERR_INVALID_PARAMS)
+    (asserts! (> (len name) u0) ERR_INVALID_PARAMS)
+    
+    ;; Create the circle record
+    (map-set circles
+      { circle-id: circle-id }
+      {
+        name: name,
+        creator: tx-sender,
+        is-public: is-public,
+        stake-threshold: stake-threshold,
+        total-staked: u0,
+        member-count: u0,
+        created-at: stacks-block-height,
+        reputation-weight: u100
+      }
+    )
+    
+    ;; Auto-join creator as founding member
+    (try! (join-circle circle-id stake-threshold))
+    
+    ;; Increment circle counter
+    (var-set next-circle-id (+ circle-id u1))
+    
+    (ok circle-id)
+  )
+)
