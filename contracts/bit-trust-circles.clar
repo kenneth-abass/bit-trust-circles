@@ -200,3 +200,111 @@
     (ok circle-id)
   )
 )
+
+(define-public (join-circle (circle-id uint) (stake-amount uint))
+  ;; Join an existing circle by staking the required amount
+  (let ((circle (unwrap! (map-get? circles { circle-id: circle-id }) ERR_CIRCLE_NOT_FOUND)))
+    ;; Validation checks
+    (asserts! (not (is-circle-member circle-id tx-sender)) ERR_ALREADY_MEMBER)
+    (asserts! (>= stake-amount (get stake-threshold circle)) ERR_INSUFFICIENT_STAKE)
+    (asserts! (>= (stx-get-balance tx-sender) stake-amount) ERR_INSUFFICIENT_BALANCE)
+    
+    ;; Transfer stake to protocol escrow
+    (try! (stx-transfer? stake-amount tx-sender (as-contract tx-sender)))
+    
+    ;; Record escrowed amount
+    (map-set escrow-balances
+      { user: tx-sender, circle-id: circle-id }
+      { amount: stake-amount }
+    )
+    
+    ;; Add member to circle
+    (map-set circle-members
+      { circle-id: circle-id, member: tx-sender }
+      {
+        stake-amount: stake-amount,
+        reputation-score: u0,
+        joined-at: stacks-block-height,
+        last-activity: stacks-block-height,
+        is-active: true
+      }
+    )
+    
+    ;; Update circle statistics
+    (map-set circles
+      { circle-id: circle-id }
+      (merge circle {
+        total-staked: (+ (get total-staked circle) stake-amount),
+        member-count: (+ (get member-count circle) u1)
+      })
+    )
+    
+    ;; Award reputation bonus for joining
+    (update-user-reputation tx-sender 10)
+    
+    (ok true)
+  )
+)
+
+(define-public (leave-circle (circle-id uint))
+  ;; Leave a circle and withdraw staked amount
+  (let ((circle (unwrap! (map-get? circles { circle-id: circle-id }) ERR_CIRCLE_NOT_FOUND))
+        (member-data (unwrap! (map-get? circle-members { circle-id: circle-id, member: tx-sender }) ERR_NOT_MEMBER))
+        (escrow-data (unwrap! (map-get? escrow-balances { user: tx-sender, circle-id: circle-id }) ERR_NOT_MEMBER)))
+    
+    ;; Return staked amount from escrow
+    (try! (as-contract (stx-transfer? (get amount escrow-data) tx-sender tx-sender)))
+    
+    ;; Clean up member records
+    (map-delete circle-members { circle-id: circle-id, member: tx-sender })
+    (map-delete escrow-balances { user: tx-sender, circle-id: circle-id })
+    
+    ;; Update circle statistics
+    (map-set circles
+      { circle-id: circle-id }
+      (merge circle {
+        total-staked: (- (get total-staked circle) (get stake-amount member-data)),
+        member-count: (- (get member-count circle) u1)
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+;; PUBLIC FUNCTIONS - REPUTATION & SOCIAL CAPITAL
+
+(define-public (endorse-member (circle-id uint) (target principal) (amount uint))
+  ;; Transfer reputation points to another member (peer-to-peer endorsement)
+  (let ((endorser-data (unwrap! (map-get? circle-members { circle-id: circle-id, member: tx-sender }) ERR_NOT_MEMBER))
+        (target-data (unwrap! (map-get? circle-members { circle-id: circle-id, member: target }) ERR_NOT_MEMBER)))
+    
+    ;; Validation checks
+    (asserts! (> amount u0) ERR_INVALID_PARAMS)
+    (asserts! (>= (get reputation-score endorser-data) amount) ERR_INSUFFICIENT_BALANCE)
+    (asserts! (not (is-eq tx-sender target)) ERR_INVALID_PARAMS)
+    
+    ;; Deduct reputation from endorser
+    (map-set circle-members
+      { circle-id: circle-id, member: tx-sender }
+      (merge endorser-data {
+        reputation-score: (- (get reputation-score endorser-data) amount),
+        last-activity: stacks-block-height
+      })
+    )
+    
+    ;; Add reputation to target
+    (map-set circle-members
+      { circle-id: circle-id, member: target }
+      (merge target-data {
+        reputation-score: (+ (get reputation-score target-data) amount),
+        last-activity: stacks-block-height
+      })
+    )
+    
+    ;; Update global reputation for target
+    (update-user-reputation target (to-int amount))
+    
+    (ok true)
+  )
+)
