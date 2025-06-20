@@ -42,6 +42,8 @@
 ;; Economic parameters
 (define-constant MIN_CIRCLE_STAKE u1000000) ;; 1 STX in microSTX
 (define-constant MIN_MEMBER_STAKE u100000)  ;; 0.1 STX in microSTX
+(define-constant MAX_REPUTATION_TRANSFER u1000) ;; Max reputation transfer per transaction
+(define-constant MAX_PROPOSAL_AMOUNT u10000000) ;; Max proposal amount (10 STX)
 
 ;; Governance parameters
 (define-constant VOTING_PERIOD u1440)      ;; ~1 day in blocks (10min blocks)
@@ -167,6 +169,26 @@
   )
 )
 
+;; VALIDATION HELPERS - These address the security warnings
+(define-private (validate-circle-exists (circle-id uint))
+  (is-some (map-get? circles { circle-id: circle-id }))
+)
+
+(define-private (validate-proposal-type (proposal-type (string-ascii 32)))
+  (or (is-eq proposal-type "slash")
+      (is-eq proposal-type "reward") 
+      (is-eq proposal-type "kick")
+      (is-eq proposal-type "upgrade"))
+)
+
+(define-private (validate-amount (amount uint))
+  (and (> amount u0) (<= amount MAX_PROPOSAL_AMOUNT))
+)
+
+(define-private (validate-reputation-amount (amount uint))
+  (and (> amount u0) (<= amount MAX_REPUTATION_TRANSFER))
+)
+
 ;; PUBLIC FUNCTIONS - CIRCLE MANAGEMENT
 
 (define-public (create-circle (name (string-ascii 64)) (is-public bool) (stake-threshold uint))
@@ -175,6 +197,7 @@
     ;; Validate input parameters
     (asserts! (>= stake-threshold MIN_CIRCLE_STAKE) ERR_INVALID_PARAMS)
     (asserts! (> (len name) u0) ERR_INVALID_PARAMS)
+    (asserts! (<= (len name) u64) ERR_INVALID_PARAMS)
     
     ;; Create the circle record
     (map-set circles
@@ -205,6 +228,7 @@
   ;; Join an existing circle by staking the required amount
   (let ((circle (unwrap! (map-get? circles { circle-id: circle-id }) ERR_CIRCLE_NOT_FOUND)))
     ;; Validation checks
+    (asserts! (validate-circle-exists circle-id) ERR_CIRCLE_NOT_FOUND)
     (asserts! (not (is-circle-member circle-id tx-sender)) ERR_ALREADY_MEMBER)
     (asserts! (>= stake-amount (get stake-threshold circle)) ERR_INSUFFICIENT_STAKE)
     (asserts! (>= (stx-get-balance tx-sender) stake-amount) ERR_INSUFFICIENT_BALANCE)
@@ -251,15 +275,19 @@
   (let ((circle (unwrap! (map-get? circles { circle-id: circle-id }) ERR_CIRCLE_NOT_FOUND))
         (member-data (unwrap! (map-get? circle-members { circle-id: circle-id, member: tx-sender }) ERR_NOT_MEMBER))
         (escrow-data (unwrap! (map-get? escrow-balances { user: tx-sender, circle-id: circle-id }) ERR_NOT_MEMBER)))
+
+    ;; Explicit validation
+    (asserts! (validate-circle-exists circle-id) ERR_CIRCLE_NOT_FOUND)
+    (asserts! (is-circle-member circle-id tx-sender) ERR_NOT_MEMBER)
     
     ;; Return staked amount from escrow
     (try! (as-contract (stx-transfer? (get amount escrow-data) tx-sender tx-sender)))
     
-    ;; Clean up member records
+    ;; Safe deletion with validated circle-id
     (map-delete circle-members { circle-id: circle-id, member: tx-sender })
     (map-delete escrow-balances { user: tx-sender, circle-id: circle-id })
     
-    ;; Update circle statistics
+    ;; Safe update with validated circle-id
     (map-set circles
       { circle-id: circle-id }
       (merge circle {
@@ -279,10 +307,13 @@
   (let ((endorser-data (unwrap! (map-get? circle-members { circle-id: circle-id, member: tx-sender }) ERR_NOT_MEMBER))
         (target-data (unwrap! (map-get? circle-members { circle-id: circle-id, member: target }) ERR_NOT_MEMBER)))
     
-    ;; Validation checks
-    (asserts! (> amount u0) ERR_INVALID_PARAMS)
+    ;; Comprehensive validation
+    (asserts! (validate-circle-exists circle-id) ERR_CIRCLE_NOT_FOUND)
+    (asserts! (validate-reputation-amount amount) ERR_INVALID_PARAMS)
     (asserts! (>= (get reputation-score endorser-data) amount) ERR_INSUFFICIENT_BALANCE)
     (asserts! (not (is-eq tx-sender target)) ERR_INVALID_PARAMS)
+    (asserts! (is-circle-member circle-id tx-sender) ERR_NOT_MEMBER)
+    (asserts! (is-circle-member circle-id target) ERR_NOT_MEMBER)
     
     ;; Deduct reputation from endorser
     (map-set circle-members
@@ -312,7 +343,12 @@
 (define-public (reward-member (circle-id uint) (target principal) (amount uint))
   ;; Reward member with reputation points (governance-controlled)
   (let ((member-data (unwrap! (map-get? circle-members { circle-id: circle-id, member: target }) ERR_NOT_MEMBER)))
+    
+    ;; Comprehensive validation
+    (asserts! (validate-circle-exists circle-id) ERR_CIRCLE_NOT_FOUND)
+    (asserts! (validate-reputation-amount amount) ERR_INVALID_PARAMS)
     (asserts! (is-circle-member circle-id tx-sender) ERR_NOT_MEMBER)
+    (asserts! (is-circle-member circle-id target) ERR_NOT_MEMBER)
     
     ;; Update target's reputation in circle
     (map-set circle-members
@@ -340,8 +376,12 @@
   ;; Create a governance proposal for circle decision-making
   (let ((proposal-id (var-get next-proposal-id)))
     ;; Validation checks
+    (asserts! (validate-circle-exists circle-id) ERR_CIRCLE_NOT_FOUND)
     (asserts! (is-circle-member circle-id tx-sender) ERR_NOT_MEMBER)
+    (asserts! (validate-proposal-type proposal-type) ERR_INVALID_PARAMS)
+    (asserts! (validate-amount amount) ERR_INVALID_PARAMS)
     (asserts! (> (len description) u0) ERR_INVALID_PARAMS)
+    (asserts! (<= (len description) u256) ERR_INVALID_PARAMS)
     
     ;; Create proposal record
     (map-set proposals
@@ -373,6 +413,7 @@
         (voting-weight (calculate-voting-weight (get circle-id proposal) tx-sender)))
     
     ;; Validation checks
+    (asserts! (is-some (map-get? proposals { proposal-id: proposal-id })) ERR_PROPOSAL_NOT_FOUND)
     (asserts! (is-circle-member (get circle-id proposal) tx-sender) ERR_NOT_MEMBER)
     (asserts! (< stacks-block-height (get expires-at proposal)) ERR_VOTING_CLOSED)
     (asserts! (is-none (map-get? votes { proposal-id: proposal-id, voter: tx-sender })) ERR_ALREADY_VOTED)
@@ -404,6 +445,7 @@
         (circle (unwrap! (map-get? circles { circle-id: (get circle-id proposal) }) ERR_CIRCLE_NOT_FOUND)))
     
     ;; Validation checks
+    (asserts! (is-some (map-get? proposals { proposal-id: proposal-id })) ERR_PROPOSAL_NOT_FOUND)
     (asserts! (>= stacks-block-height (get expires-at proposal)) ERR_VOTING_CLOSED)
     (asserts! (not (get executed proposal)) ERR_INVALID_PARAMS)
     (asserts! (> (get votes-for proposal) (get votes-against proposal)) ERR_INVALID_VOTE)
