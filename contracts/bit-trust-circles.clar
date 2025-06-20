@@ -308,3 +308,92 @@
     (ok true)
   )
 )
+
+(define-public (reward-member (circle-id uint) (target principal) (amount uint))
+  ;; Reward member with reputation points (governance-controlled)
+  (let ((member-data (unwrap! (map-get? circle-members { circle-id: circle-id, member: target }) ERR_NOT_MEMBER)))
+    (asserts! (is-circle-member circle-id tx-sender) ERR_NOT_MEMBER)
+    
+    ;; Update target's reputation in circle
+    (map-set circle-members
+      { circle-id: circle-id, member: target }
+      (merge member-data {
+        reputation-score: (+ (get reputation-score member-data) amount)
+      })
+    )
+    
+    ;; Update global reputation
+    (update-user-reputation target (to-int amount))
+    
+    (ok true)
+  )
+)
+
+;; PUBLIC FUNCTIONS - DECENTRALIZED GOVERNANCE
+
+(define-public (create-proposal 
+  (circle-id uint) 
+  (proposal-type (string-ascii 32)) 
+  (target (optional principal)) 
+  (amount uint) 
+  (description (string-ascii 256)))
+  ;; Create a governance proposal for circle decision-making
+  (let ((proposal-id (var-get next-proposal-id)))
+    ;; Validation checks
+    (asserts! (is-circle-member circle-id tx-sender) ERR_NOT_MEMBER)
+    (asserts! (> (len description) u0) ERR_INVALID_PARAMS)
+    
+    ;; Create proposal record
+    (map-set proposals
+      { proposal-id: proposal-id }
+      {
+        circle-id: circle-id,
+        proposer: tx-sender,
+        proposal-type: proposal-type,
+        target: target,
+        amount: amount,
+        description: description,
+        votes-for: u0,
+        votes-against: u0,
+        total-votes: u0,
+        created-at: stacks-block-height,
+        expires-at: (+ stacks-block-height VOTING_PERIOD),
+        executed: false
+      }
+    )
+    
+    (var-set next-proposal-id (+ proposal-id u1))
+    (ok proposal-id)
+  )
+)
+
+(define-public (vote-on-proposal (proposal-id uint) (vote-for bool))
+  ;; Cast a weighted vote on a governance proposal
+  (let ((proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR_PROPOSAL_NOT_FOUND))
+        (voting-weight (calculate-voting-weight (get circle-id proposal) tx-sender)))
+    
+    ;; Validation checks
+    (asserts! (is-circle-member (get circle-id proposal) tx-sender) ERR_NOT_MEMBER)
+    (asserts! (< stacks-block-height (get expires-at proposal)) ERR_VOTING_CLOSED)
+    (asserts! (is-none (map-get? votes { proposal-id: proposal-id, voter: tx-sender })) ERR_ALREADY_VOTED)
+    (asserts! (> voting-weight u0) ERR_INSUFFICIENT_STAKE)
+    
+    ;; Record the vote
+    (map-set votes
+      { proposal-id: proposal-id, voter: tx-sender }
+      { vote: vote-for, weight: voting-weight, timestamp: stacks-block-height }
+    )
+    
+    ;; Update proposal vote tallies
+    (map-set proposals
+      { proposal-id: proposal-id }
+      (merge proposal {
+        votes-for: (if vote-for (+ (get votes-for proposal) voting-weight) (get votes-for proposal)),
+        votes-against: (if vote-for (get votes-against proposal) (+ (get votes-against proposal) voting-weight)),
+        total-votes: (+ (get total-votes proposal) voting-weight)
+      })
+    )
+    
+    (ok true)
+  )
+)
