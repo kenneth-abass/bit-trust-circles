@@ -397,3 +397,82 @@
     (ok true)
   )
 )
+
+(define-public (execute-proposal (proposal-id uint))
+  ;; Execute a passed governance proposal
+  (let ((proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR_PROPOSAL_NOT_FOUND))
+        (circle (unwrap! (map-get? circles { circle-id: (get circle-id proposal) }) ERR_CIRCLE_NOT_FOUND)))
+    
+    ;; Validation checks
+    (asserts! (>= stacks-block-height (get expires-at proposal)) ERR_VOTING_CLOSED)
+    (asserts! (not (get executed proposal)) ERR_INVALID_PARAMS)
+    (asserts! (> (get votes-for proposal) (get votes-against proposal)) ERR_INVALID_VOTE)
+    
+    ;; Check quorum requirement (60% of total stake must participate)
+    (let ((required-votes (/ (* (get total-staked circle) QUORUM_THRESHOLD) u100)))
+      (asserts! (>= (get total-votes proposal) required-votes) ERR_INVALID_VOTE)
+    )
+    
+    ;; Mark proposal as executed
+    (map-set proposals
+      { proposal-id: proposal-id }
+      (merge proposal { executed: true })
+    )
+    
+    ;; Execute proposal based on type
+    (if (is-eq (get proposal-type proposal) "reward")
+      (match (get target proposal)
+        target-principal (reward-member (get circle-id proposal) target-principal (get amount proposal))
+        ERR_INVALID_PARAMS
+      )
+      (ok true) ;; Additional proposal types can be implemented here
+    )
+  )
+)
+
+;; READ-ONLY FUNCTIONS - PUBLIC QUERIES
+
+(define-read-only (get-circle-info (circle-id uint))
+  ;; Get complete information about a trust circle
+  (map-get? circles { circle-id: circle-id })
+)
+
+(define-read-only (get-member-info (circle-id uint) (member principal))
+  ;; Get member information within a specific circle
+  (map-get? circle-members { circle-id: circle-id, member: member })
+)
+
+(define-read-only (get-user-reputation (user principal))
+  ;; Get global reputation data for a user
+  (map-get? user-reputation { user: user })
+)
+
+(define-read-only (get-proposal-info (proposal-id uint))
+  ;; Get complete information about a governance proposal
+  (map-get? proposals { proposal-id: proposal-id })
+)
+
+(define-read-only (get-vote-info (proposal-id uint) (voter principal))
+  ;; Get voting information for specific proposal and voter
+  (map-get? votes { proposal-id: proposal-id, voter: voter })
+)
+
+(define-read-only (get-escrow-balance (user principal) (circle-id uint))
+  ;; Get escrowed stake amount for user in specific circle
+  (map-get? escrow-balances { user: user, circle-id: circle-id })
+)
+
+(define-read-only (is-member (circle-id uint) (user principal))
+  ;; Check if user is a member of specified circle
+  (is-circle-member circle-id user)
+)
+
+(define-read-only (get-next-circle-id)
+  ;; Get the next available circle ID
+  (var-get next-circle-id)
+)
+
+(define-read-only (get-next-proposal-id)
+  ;; Get the next available proposal ID
+  (var-get next-proposal-id)
+)
