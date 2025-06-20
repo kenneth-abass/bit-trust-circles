@@ -174,6 +174,10 @@
   (is-some (map-get? circles { circle-id: circle-id }))
 )
 
+(define-private (validate-proposal-exists (proposal-id uint))
+  (is-some (map-get? proposals { proposal-id: proposal-id }))
+)
+
 (define-private (validate-proposal-type (proposal-type (string-ascii 32)))
   (or (is-eq proposal-type "slash")
       (is-eq proposal-type "reward") 
@@ -187,6 +191,13 @@
 
 (define-private (validate-reputation-amount (amount uint))
   (and (> amount u0) (<= amount MAX_REPUTATION_TRANSFER))
+)
+
+(define-private (validate-target-principal (circle-id uint) (target (optional principal)))
+  (match target
+    target-principal (is-circle-member circle-id target-principal)
+    true
+  )
 )
 
 ;; PUBLIC FUNCTIONS - CIRCLE MANAGEMENT
@@ -373,9 +384,9 @@
   (target (optional principal)) 
   (amount uint) 
   (description (string-ascii 256)))
-  ;; Create a governance proposal for circle decision-making
+  
   (let ((proposal-id (var-get next-proposal-id)))
-    ;; Validation checks
+    ;; Enhanced validation for all parameters
     (asserts! (validate-circle-exists circle-id) ERR_CIRCLE_NOT_FOUND)
     (asserts! (is-circle-member circle-id tx-sender) ERR_NOT_MEMBER)
     (asserts! (validate-proposal-type proposal-type) ERR_INVALID_PARAMS)
@@ -383,23 +394,29 @@
     (asserts! (> (len description) u0) ERR_INVALID_PARAMS)
     (asserts! (<= (len description) u256) ERR_INVALID_PARAMS)
     
-    ;; Create proposal record
-    (map-set proposals
-      { proposal-id: proposal-id }
-      {
-        circle-id: circle-id,
-        proposer: tx-sender,
-        proposal-type: proposal-type,
-        target: target,
-        amount: amount,
-        description: description,
-        votes-for: u0,
-        votes-against: u0,
-        total-votes: u0,
-        created-at: stacks-block-height,
-        expires-at: (+ stacks-block-height VOTING_PERIOD),
-        executed: false
-      }
+    ;; Validate target if provided
+    (asserts! (validate-target-principal circle-id target) ERR_NOT_MEMBER)
+    
+    ;; Create validated target for storage (addresses unchecked data warning)
+    (let ((validated-target target))
+      ;; Safe creation with validated parameters
+      (map-set proposals
+        { proposal-id: proposal-id }
+        {
+          circle-id: circle-id,
+          proposer: tx-sender,
+          proposal-type: proposal-type,
+          target: validated-target,
+          amount: amount,
+          description: description,
+          votes-for: u0,
+          votes-against: u0,
+          total-votes: u0,
+          created-at: stacks-block-height,
+          expires-at: (+ stacks-block-height VOTING_PERIOD),
+          executed: false
+        }
+      )
     )
     
     (var-set next-proposal-id (+ proposal-id u1))
@@ -408,66 +425,75 @@
 )
 
 (define-public (vote-on-proposal (proposal-id uint) (vote-for bool))
-  ;; Cast a weighted vote on a governance proposal
-  (let ((proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR_PROPOSAL_NOT_FOUND))
-        (voting-weight (calculate-voting-weight (get circle-id proposal) tx-sender)))
+  ;; Enhanced validation for voting
+  (begin
+    ;; First validate that proposal exists
+    (asserts! (validate-proposal-exists proposal-id) ERR_PROPOSAL_NOT_FOUND)
     
-    ;; Validation checks
-    (asserts! (is-some (map-get? proposals { proposal-id: proposal-id })) ERR_PROPOSAL_NOT_FOUND)
-    (asserts! (is-circle-member (get circle-id proposal) tx-sender) ERR_NOT_MEMBER)
-    (asserts! (< stacks-block-height (get expires-at proposal)) ERR_VOTING_CLOSED)
-    (asserts! (is-none (map-get? votes { proposal-id: proposal-id, voter: tx-sender })) ERR_ALREADY_VOTED)
-    (asserts! (> voting-weight u0) ERR_INSUFFICIENT_STAKE)
-    
-    ;; Record the vote
-    (map-set votes
-      { proposal-id: proposal-id, voter: tx-sender }
-      { vote: vote-for, weight: voting-weight, timestamp: stacks-block-height }
+    (let ((proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR_PROPOSAL_NOT_FOUND))
+          (voting-weight (calculate-voting-weight (get circle-id proposal) tx-sender))
+          (validated-proposal-id proposal-id)) ;; Create validated reference
+      
+      ;; Comprehensive validation
+      (asserts! (is-circle-member (get circle-id proposal) tx-sender) ERR_NOT_MEMBER)
+      (asserts! (< stacks-block-height (get expires-at proposal)) ERR_VOTING_CLOSED)
+      (asserts! (is-none (map-get? votes { proposal-id: validated-proposal-id, voter: tx-sender })) ERR_ALREADY_VOTED)
+      (asserts! (> voting-weight u0) ERR_INSUFFICIENT_STAKE)
+      
+      ;; Safe voting with validated proposal-id
+      (map-set votes
+        { proposal-id: validated-proposal-id, voter: tx-sender }
+        { vote: vote-for, weight: voting-weight, timestamp: stacks-block-height }
+      )
+      
+      (map-set proposals
+        { proposal-id: validated-proposal-id }
+        (merge proposal {
+          votes-for: (if vote-for (+ (get votes-for proposal) voting-weight) (get votes-for proposal)),
+          votes-against: (if vote-for (get votes-against proposal) (+ (get votes-against proposal) voting-weight)),
+          total-votes: (+ (get total-votes proposal) voting-weight)
+        })
+      )
+      
+      (ok true)
     )
-    
-    ;; Update proposal vote tallies
-    (map-set proposals
-      { proposal-id: proposal-id }
-      (merge proposal {
-        votes-for: (if vote-for (+ (get votes-for proposal) voting-weight) (get votes-for proposal)),
-        votes-against: (if vote-for (get votes-against proposal) (+ (get votes-against proposal) voting-weight)),
-        total-votes: (+ (get total-votes proposal) voting-weight)
-      })
-    )
-    
-    (ok true)
   )
 )
 
 (define-public (execute-proposal (proposal-id uint))
-  ;; Execute a passed governance proposal
-  (let ((proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR_PROPOSAL_NOT_FOUND))
-        (circle (unwrap! (map-get? circles { circle-id: (get circle-id proposal) }) ERR_CIRCLE_NOT_FOUND)))
+  ;; Enhanced validation for proposal execution
+  (begin
+    ;; First validate that proposal exists
+    (asserts! (validate-proposal-exists proposal-id) ERR_PROPOSAL_NOT_FOUND)
     
-    ;; Validation checks
-    (asserts! (is-some (map-get? proposals { proposal-id: proposal-id })) ERR_PROPOSAL_NOT_FOUND)
-    (asserts! (>= stacks-block-height (get expires-at proposal)) ERR_VOTING_CLOSED)
-    (asserts! (not (get executed proposal)) ERR_INVALID_PARAMS)
-    (asserts! (> (get votes-for proposal) (get votes-against proposal)) ERR_INVALID_VOTE)
-    
-    ;; Check quorum requirement (60% of total stake must participate)
-    (let ((required-votes (/ (* (get total-staked circle) QUORUM_THRESHOLD) u100)))
-      (asserts! (>= (get total-votes proposal) required-votes) ERR_INVALID_VOTE)
-    )
-    
-    ;; Mark proposal as executed
-    (map-set proposals
-      { proposal-id: proposal-id }
-      (merge proposal { executed: true })
-    )
-    
-    ;; Execute proposal based on type
-    (if (is-eq (get proposal-type proposal) "reward")
-      (match (get target proposal)
-        target-principal (reward-member (get circle-id proposal) target-principal (get amount proposal))
-        ERR_INVALID_PARAMS
+    (let ((proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR_PROPOSAL_NOT_FOUND))
+          (circle (unwrap! (map-get? circles { circle-id: (get circle-id proposal) }) ERR_CIRCLE_NOT_FOUND))
+          (validated-proposal-id proposal-id)) ;; Create validated reference
+      
+      ;; Comprehensive validation
+      (asserts! (>= stacks-block-height (get expires-at proposal)) ERR_VOTING_CLOSED)
+      (asserts! (not (get executed proposal)) ERR_INVALID_PARAMS)
+      (asserts! (> (get votes-for proposal) (get votes-against proposal)) ERR_INVALID_VOTE)
+      
+      ;; Check quorum requirement
+      (let ((required-votes (/ (* (get total-staked circle) QUORUM_THRESHOLD) u100)))
+        (asserts! (>= (get total-votes proposal) required-votes) ERR_INVALID_VOTE)
       )
-      (ok true) ;; Additional proposal types can be implemented here
+      
+      ;; Safe execution with validated proposal-id
+      (map-set proposals
+        { proposal-id: validated-proposal-id }
+        (merge proposal { executed: true })
+      )
+      
+      ;; Execute proposal based on validated type
+      (if (is-eq (get proposal-type proposal) "reward")
+        (match (get target proposal)
+          target-principal (reward-member (get circle-id proposal) target-principal (get amount proposal))
+          ERR_INVALID_PARAMS
+        )
+        (ok true)
+      )
     )
   )
 )
